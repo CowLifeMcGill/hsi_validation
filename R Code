@@ -1,0 +1,1777 @@
+###------------------------------------------------------------------------###
+###------------------------------------------------------------------------###
+
+# Validation of the pre-recorded data-based Herd Status Index as a remote tool 
+# to evaluate the welfare status of dairy herds
+
+###------------------------------------------------------------------------###
+###------------------------------------------------------------------------###
+
+
+# Loading packages --------------------------------------------------------
+
+extrafont::loadfonts(device = "win")
+
+require(tidyverse)
+require(tidylog)
+require(readxl)
+require(PerformanceAnalytics)
+require(tsne)
+
+require(fpc) # Cluster validation
+require(emmeans)
+
+require(cowplot)
+
+
+# Helper function ---------------------------------------------------------
+
+getSeason <- function(DATES) {
+  WS <- as.Date("2012-12-15", format = "%Y-%m-%d") # Winter Solstice
+  SE <- as.Date("2012-3-15",  format = "%Y-%m-%d") # Spring Equinox
+  SS <- as.Date("2012-6-15",  format = "%Y-%m-%d") # Summer Solstice
+  FE <- as.Date("2012-9-15",  format = "%Y-%m-%d") # Fall Equinox
+  
+  # Convert dates from any year to 2012 dates
+  d <- as.Date(strftime(DATES, format="2012-%m-%d"))
+  
+  factor(ifelse (d >= WS | d < SE, "Winter",
+                 ifelse (d >= SE & d < SS, "Spring",
+                         ifelse (d >= SS & d < FE, "Summer", "Fall"))),
+         levels = c("Winter", "Spring", "Summer", "Fall"))
+}
+
+
+
+
+# Loading data ------------------------------------------------------------
+
+
+pa <- readRDS(paste(data_dir, "/", "proAction_anon_hrd_tbl.rds", sep = ""))
+lpl <- readRDS(paste(data_dir, "/", "prod_lifetime_anon_anm_tbl.rds", sep = ""))
+research_data <- readRDS(paste(data_dir, "/", "res_data_anon_anm_tbl.rds", sep = ""))
+survey <- readRDS(paste(data_dir, "/", "survey_calf_feed_anon_tbl.rds", sep = ""))
+hsi <- readRDS(paste(data_dir, "/", "whi_indicators_anon_tbl.rds", sep = ""))
+
+
+# Assigning a more readable herd ID and animal ID
+
+unique_hrd_id <- pa %>% 
+  select(id) %>% 
+  drop_na() %>% 
+  union(lpl %>% select(id),
+        research_data %>% select(id),
+        survey %>% select(id),
+        hsi %>%  select(id)) %>% 
+  mutate(hrd_id = seq_along(id))
+
+
+# Replacing herd and animal ids
+
+pa <- pa %>% 
+  drop_na(id) %>% 
+  left_join(unique_hrd_id, by = "id") %>% 
+  select(hrd_id, setdiff(names(pa), c("id")))
+
+
+# Duplicated observations
+pa1 <- pa %>% 
+  mutate(visit_date = as.Date(visit_date, format = "%B %d, %Y")) %>% 
+  group_by(hrd_id, visit_date) %>%
+  add_count() %>%
+  ungroup() %>%
+  filter(n == 1) %>%
+  
+  # Keeping the most recent
+  group_by(hrd_id) %>% 
+  arrange(desc(visit_date), .by_group = TRUE) %>% 
+  mutate(n = row_number()) %>% 
+  ungroup() %>% 
+  filter(n == 1) %>% 
+  select(-n)
+
+
+hsi <- hsi %>% 
+  drop_na(id) %>% 
+  left_join(unique_hrd_id, by = "id") %>% 
+  select(hrd_id, setdiff(names(hsi), c("id"))) %>% 
+  
+  # Keeping only the last 12 months starting at the proAction evaluation
+  mutate(period = as.numeric(as.Date(visit_date, format = "%V-%m-%d") - 
+                               as.Date(test_date, format = "%V-%m-%d"))) %>%
+  filter(period <= 365.25)
+
+
+
+# Cleaning DHI data -------------------------------------------------------
+
+
+# Creating variables to calculate the index
+# Converting age at first calving from days to months
+
+
+hsi1 <- hsi  %>% 
+  
+  # Keeping only herds with at least 3 tests over the previos 12 months
+
+  filter(cnttests >= 3) %>% 
+  
+  mutate(sold_dairy_pcntg = (sold_dairy_cnt / avg_num_cows)*100,
+         involuntary_pcntg = avg_pcntg_trnvr - sold_dairy_pcntg,
+         avg_mortality_pcntg = (num_cow_dead_yr/avg_num_cows)*100,
+         
+         age1stcalv = (age1stcalv/365.25)*12) %>%  
+  
+    select(hrd_id, avg_num_cows, cnttests, avg_pcntg_lgvt, involuntary_pcntg,
+         avg_mortality_pcntg, pctmun5, pctpfratio11, enercorr_mi, avg_tci_yr,
+         day_life_value_rank, pctcalfdead, age1stcalv, pct_lact_start_abortion,
+         pctbhb20, pctccs400)
+
+
+
+# Identifying and removing outliers
+
+# Average percentage of cows on 3+ lactation
+
+hsi1 %>% 
+  pull(avg_pcntg_lgvt) %>% 
+  hist()
+
+hsi1 %>% 
+  pull(avg_pcntg_lgvt) %>% 
+  summary()
+
+# Not much indication of problem here!
+
+
+# Involuntary culling
+hsi1 %>% 
+  pull(involuntary_pcntg) %>% 
+  hist()
+
+hsi1 %>% 
+  pull(involuntary_pcntg) %>% 
+  summary()
+
+
+
+
+hsi1 %>% 
+  filter(involuntary_pcntg >= 0, involuntary_pcntg <= 100) %>% 
+  pull(involuntary_pcntg) %>% 
+  hist()
+
+hsi1 %>% 
+  filter(involuntary_pcntg >= 0, involuntary_pcntg <= 100) %>% 
+  pull(involuntary_pcntg) %>% 
+  summary()
+
+# Removing observations where percentage of involuntary culling is higher than 100%
+# and lower than 0%
+
+hsi2 <- hsi1 %>% 
+  filter(involuntary_pcntg >= 0, involuntary_pcntg <= 100)
+
+
+
+
+# avg_mortality_pcntg
+hsi2 %>% 
+  pull(avg_mortality_pcntg) %>% 
+  hist()
+
+hsi2 %>% 
+  pull(avg_mortality_pcntg) %>% 
+  summary()
+
+
+# No indication of problem here!
+
+
+# pctmun5
+
+hsi2 %>% 
+  pull(pctmun5) %>% 
+  hist()
+
+hsi2 %>% 
+  pull(pctmun5) %>% 
+  summary()
+
+
+# Data is very skewed, but there is not much justifiable reason to remove observations!
+
+
+# pctpfratio11
+
+hsi2 %>%  
+  pull(pctpfratio11) %>% 
+  hist()
+
+hsi2 %>% 
+  pull(pctpfratio11) %>% 
+  summary()
+
+
+
+# Data is very skewed, but there is not much justifiable reason to remove data!
+
+
+# enercorr_mi
+
+hsi2 %>%  
+  pull(enercorr_mi) %>% 
+  hist()
+
+hsi2 %>% 
+  pull(enercorr_mi) %>% 
+  summary()
+
+# No indication of problem here!
+
+
+# avg_tci_yr
+
+hsi2 %>%  
+  pull(avg_tci_yr) %>% 
+  hist()
+
+hsi2 %>% 
+  pull(avg_tci_yr) %>% 
+  summary()
+
+# No indication of problem here!
+
+
+# day_life_value_rank
+
+hsi2 %>%  
+  pull(day_life_value_rank) %>% 
+  hist()
+
+hsi2 %>% 
+  pull(day_life_value_rank) %>% 
+  summary()
+
+# No indication of problem here!
+
+
+# pctcalfdead
+
+hsi2 %>%  
+  pull(pctcalfdead) %>% 
+  hist()
+
+hsi2 %>% 
+  pull(pctcalfdead) %>% 
+  summary()
+
+# Data is very skewed, but there is not much justifiable reason to remove data!
+
+
+# Age at 1st calving
+
+hsi2 %>% 
+  pull(age1stcalv) %>% 
+  hist()
+
+hsi2 %>% 
+  pull(age1stcalv) %>% 
+  summary()
+
+
+# Impossible age at first calving is impossible. Removing those observations
+hsi3 <- hsi2 %>% 
+  filter(age1stcalv > 0)
+
+
+hsi3 %>% 
+  pull(age1stcalv) %>% 
+  hist()
+
+hsi3 %>% 
+  pull(age1stcalv) %>% 
+  summary()
+
+
+# pct_lact_start_abortion
+
+hsi3 %>%  
+  pull(pct_lact_start_abortion) %>% 
+  hist()
+
+hsi3 %>% 
+  pull(pct_lact_start_abortion) %>% 
+  summary()
+
+# Data is very skewed, but there is not much justifiable reason to remove data!
+
+
+# pctbhb20
+
+hsi3 %>%  
+  pull(pctbhb20) %>% 
+  hist()
+
+hsi3 %>% 
+  pull(pctbhb20) %>% 
+  summary()
+
+# No indication of problem here!
+
+# pctccs400
+
+hsi3 %>%  
+  pull(pctccs400) %>% 
+  hist()
+
+hsi3 %>% 
+  pull(pctccs400) %>% 
+  summary()
+
+# No indication of problem here!
+
+
+
+# Calculating a final average per herd and removing herds with more than 3 variables
+# with missing observations
+
+hsi4 <- hsi3 %>%
+  select(-cnttests) %>% 
+  group_by(hrd_id) %>% 
+  summarise_if(is.numeric, mean, na.rm = T) %>% 
+  ungroup() %>% 
+  mutate(na = rowSums(is.na(.))) %>%
+  filter(na <= 3) %>% 
+  select(-na)
+  
+
+
+  
+
+# Welfare outcomes  indicate the percentage of animals where the welfare measure
+# was not an issue. This could be harder to understand. So I will convert it to indicate 
+# the percentage of animals where the welfare measure indicated an issue.
+# Also calculating season of the assessment
+
+
+pa2 <- pa1 %>% 
+  mutate(season = getSeason(visit_date),
+         year = lubridate::year(visit_date),
+         BCS = 100 - bcs_percent,
+         HOCK = 100 - hock_percent,
+         KNEE = 100- knee_percent, 
+         NECK = 100 - neck_percent,
+         LAME = 100 - lame_percent) %>% 
+
+  filter(BCS >= 0, HOCK >= 0, KNEE >= 0, NECK >= 0, LAME >= 0) %>%
+  
+  # Keeping only free-stall and tie-stall barns
+  filter(barn_type %in% c("Freestall", "Tiestall")) %>% 
+  
+  mutate_if(is.character, as.factor) %>% 
+    select(hrd_id, visit_date, season, year, barn_type, BCS, HOCK,
+         KNEE, NECK, LAME)
+
+
+
+# Merging DHI and proAction datasets
+
+wd1 <- inner_join(pa2, hsi4, by = "hrd_id")
+summary(wd1$visit_date)
+
+
+summary(wd1)
+
+
+## Calculating the Herd Status Index ####
+
+
+rank <- c("avg_pcntg_lgvt", "enercorr_mi", "avg_tci_yr")
+
+recp.rank <- c("involuntary_pcntg", "avg_mortality_pcntg", "pctmun5",
+               "pctpfratio11", "day_life_value_rank", "pctcalfdead",
+               "age1stcalv", "pct_lact_start_abortion", "pctbhb20",
+               "pctccs400")
+
+
+wd2 <- wd1 %>% 
+  
+  # Getting number of indicators with no missing observations
+  select(rank, recp.rank) %>% 
+  mutate(n_indexes = 13-rowSums(is.na(.))) %>% 
+  select(n_indexes) %>% 
+  bind_cols(wd1, .) %>% 
+
+  # Percentile ranking indicators
+  mutate_at(rank, percent_rank) %>%
+
+  # Reciprocal of percentile ranking indicators
+  mutate_at(recp.rank, ~ 1 - percent_rank(.)) %>%
+  
+  
+  # Calculating the Index
+    mutate(agreg_ind = rowSums(select(., all_of(rank), all_of(recp.rank)), na.rm = TRUE),
+           HSI = agreg_ind/n_indexes) %>% 
+  
+  # Dropping intermediary variables
+  select(-n_indexes, -agreg_ind)
+  
+
+# Getting descriptive stats for manuscript
+
+length(unique(wd2$hrd_id))
+
+wd2 %>% 
+  select(avg_num_cows, visit_date) %>% 
+  summary()
+
+
+
+wd2 %>% 
+  select(BCS, HOCK, KNEE, NECK, LAME, HSI) %>% 
+  summarise_all(mean, na.rm = T) %>% 
+  round(., 2)
+
+wd1 %>% 
+  select(all_of(c(rank, recp.rank))) %>% 
+  summarise_all(mean, na.rm = T) %>% 
+  as.data.frame() %>% 
+  round(., 2)
+  
+
+
+
+wd2 %>% 
+  select(BCS, HOCK, KNEE, NECK, LAME, HSI) %>% 
+  summarise_all(sd, na.rm = T) %>% 
+  round(., 3)
+
+wd1 %>% 
+  select(all_of(c(rank, recp.rank))) %>% 
+  summarise_all(sd, na.rm = T) %>% 
+  as.data.frame() %>% 
+  round(., 1)
+
+
+
+
+
+wd2 %>% 
+  select(BCS, HOCK, KNEE, NECK, LAME, HSI) %>% 
+  summarise_all(min, na.rm = T) %>% 
+  round(., 2)
+
+wd1 %>% 
+  select(all_of(c(rank, recp.rank))) %>% 
+  summarise_all(min, na.rm = T) %>% 
+  as.data.frame() %>% 
+  round(., 2)
+
+
+
+
+wd2 %>% 
+  select(BCS, HOCK, KNEE, NECK, LAME, HSI) %>% 
+  summarise_all(max, na.rm = T) %>% 
+  round(., 2)
+
+wd1 %>% 
+  select(all_of(c(rank, recp.rank))) %>% 
+  summarise_all(max, na.rm = T) %>% 
+  as.data.frame() %>% 
+  round(., 3)
+
+
+
+
+
+# Clustering ####
+clust.wd <- wd2 %>% 
+  select(BCS, HOCK, KNEE, NECK, LAME)
+
+clust.dist <- dist(clust.wd,
+                   method = "euclidean")
+
+
+# Calculating correlation to evaluate multicolinearity 
+PerformanceAnalytics::chart.Correlation(clust.wd)
+
+psych::corr.test(clust.wd,
+                 adjust = "bonferroni") %>% 
+  print(short = FALSE)
+
+
+# Calculating clustering tendency
+clust.tend <- get_clust_tendency(clust.wd, 
+                                 n = nrow(clust.wd)-1,
+                                 graph = FALSE,
+                                 seed = 1801)
+
+clust.tend
+
+
+## Cluster Validation ####
+
+# Jaccard's bootstrap distance
+
+
+valid.ward <- list()
+
+for(i in 2:7){
+  
+  cbv <- clusterboot(data = clust.dist,
+                     distances = TRUE,
+                     B = 100,
+                     bootmethod = "boot",
+                     clustermethod = disthclustCBI,
+                     noisemethod = FALSE,
+                     k = i,
+                     method = "ward.D2",
+                     seed = 1801,
+                     count = TRUE)
+  
+  valid.ward[[i]] <- cbv
+  
+}
+
+
+valid.pam <- list()
+
+for(i in 2:7){
+  
+  cbv <- clusterboot(data = clust.dist,
+                     distances = TRUE,
+                     B = 100,
+                     bootmethod = "boot",
+                     clustermethod = claraCBI,
+                     noisemethod = FALSE,
+                     k = i,
+                     usepam = TRUE,
+                     seed = 1801,
+                     count = TRUE)
+  
+  valid.pam[[i]] <- cbv
+  
+}
+
+
+
+valid.mclust <- list() # normal mixture model
+
+for(i in 2:7){
+  
+  cbv <- clusterboot(data = clust.dist,
+                     distances = TRUE,
+                     B = 100,
+                     bootmethod = "boot",
+                     clustermethod = distnoisemclustCBI,
+                     noisemethod = FALSE,
+                     k = i,
+                     seed = 1801,
+                     count = TRUE)
+  
+  valid.mclust[[i]] <- cbv
+  
+}
+
+
+options(digits = 2)
+valid.ward
+valid.pam
+valid.mclust
+
+
+
+# Calculating internal quality indexes of stable clusters
+
+# Calinski–Harabasz index
+for(i in 2:5) {
+  
+  set.seed(1801)
+  cluster.stats(d = clust.dist, 
+                clustering = claraCBI(data = clust.dist,
+                                      k = i,
+                                      usepam = TRUE,
+                                      diss = TRUE)$partition,
+                noisecluster = FALSE,
+                silhouette = TRUE,
+                wgap = FALSE, sepindex = FALSE,
+                sepwithnoise = TRUE,
+                aggregateonly = TRUE)[c("cluster.number", "ch")] %>%
+    print()
+  
+  
+}
+
+
+
+for(i in 2:3) {
+  
+  set.seed(1801)
+  cluster.stats(d = clust.dist, 
+                clustering = distnoisemclustCBI(dmatrix = clust.dist,
+                                      G = i)$partition,
+                noisecluster = FALSE,
+                silhouette = TRUE,
+                wgap = FALSE, sepindex = FALSE,
+                sepwithnoise = TRUE,
+                aggregateonly = TRUE)[c("cluster.number", "ch")] %>%
+    print()
+  
+  
+}
+
+
+
+
+# Additionally, following methodology proposed by Akhanli and Hennig (2020)
+# doi.org/10.1007/s11222-020-09958-2 and calculating A1 and A2 indexes
+
+clustermethodpars <- list()
+
+clustermethodpars[[2]] <- list()
+clustermethodpars[[2]]$prior <- NULL
+
+
+bootclassif <- c("centroid", # because of PAM clustering
+                 "averagedist") 
+
+set.seed(1801)
+val_boostcluster_stats <- clusterbenchstats(data = clust.dist,
+                                            G = c(2, 3, 4, 5),
+                                            diss = TRUE,
+                                            scaling = FALSE,
+                                            clustermethod = c("claraCBI", 
+                                                              "noisemclustCBI"),
+                                            methodnames = c("PAM", 
+                                                            "MixModel"),
+                                            distmethod = rep(TRUE, 2),
+                                            clustermethodpars = clustermethodpars,
+                                            useboot = TRUE,
+                                            bootruns = 10,
+                                            bootclassif = bootclassif,
+                                            nnruns = 10,
+                                            kmruns = 10,
+                                            fnruns = 10,
+                                            avenruns = 10,
+                                            trace = TRUE,
+                                            useallg = TRUE)
+
+
+
+# Index A1 in Akhanli and Hennig (2020) (need these weights choices):
+# A1 puts more emphasis on cluster homogeneity
+print(val_boostcluster_stats$sstat,
+      aggregate = TRUE,
+      weights = c(1,0,0,0,0,0,0,0,0,0,0,1,0,0,0,1,0))
+
+
+# Index A2 in Akhanli and Hennig (2020) (need these weights choices):
+# A2 puts more emphasis on cluster separation
+print(val_boostcluster_stats$sstat,
+      aggregate = TRUE,
+      weights = c(0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,1,0))
+
+
+# Return the digits number to default
+options(digits = 7)
+
+
+
+
+
+
+## PAM clustering ####
+# There was no clear best clustering solution! However, since 3 clusters 
+# using PAM had the highest stability, I will be using these clustering approach.
+
+set.seed(1801)
+f.cluster <- cluster::pam(x = clust.wd,
+                          k = 3,
+                          metric = "euclidean")
+
+
+
+### Plotting PAM cluster results on t-SNE ####
+colors <- c("#377EB8", "#4DAF4A", "#FC4E07")
+names(colors) = unique(f.cluster$clustering)
+
+
+
+ecb = function(x,y){ 
+  
+  plot(x,
+       t='n'); 
+  text(x,
+       labels = f.cluster$clustering, 
+       col = colors[f.cluster$clustering]) 
+  
+}
+
+
+
+set.seed(1801) # Sets seed for reproducibility
+tsne_out <- tsne(X = dist(clust.wd,
+                          method = "euclidean"),
+                 k = 2,
+                 
+                 max_iter = 100, 
+                 perplexity = 40, 
+                 
+                 epoch_callback = ecb,
+                 epoch = 20)
+
+
+ggplot(tsne_out %>% 
+         data.frame() %>% 
+         mutate(cluster = factor(f.cluster$clustering)),
+       aes(x = X1,
+           y = X2,
+           colour = cluster,
+           shape = cluster)) +
+  geom_point() +
+  scale_colour_manual(values = c("#377EB8", "#4DAF4A", "#FC4E07")) +
+  theme_classic(base_family = "Times New Roman") + 
+  
+  labs(x = "tSNE 1",
+       y = "tSNE 2",
+       colour = "Cluster",
+       shape = "Cluster") +
+  
+  theme(axis.text = element_text(size = 10, color = "black"),
+        legend.text = element_text(size = 10, family = "Times New Roman"),
+        legend.position = c(0.945, 0.15),
+        legend.background = element_rect(fill = "white", color = "black"),
+        legend.justification="center",
+        axis.title.x = element_text(size = 12, 
+                                    margin = margin(t = 10, # top
+                                                    r = 0, # right 
+                                                    b = 0, # bottom
+                                                    l = 0)),  # left
+        axis.title.y = element_text(size = 12,
+                                    margin = margin(t = 0, # top
+                                                    r = 10, # right 
+                                                    b = 0, # bottom
+                                                    l = 0)),
+        legend.title.align = 0.5)
+  
+
+
+
+# Creating final data file with cluster results
+
+wd3 <- wd2 %>% 
+  select(hrd_id, HSI) %>% 
+  left_join(wd1, by = "hrd_id") %>%
+  mutate(cluster = factor(f.cluster$cluster),
+         year = factor(year))
+
+
+names(wd3)
+length(unique(wd3$hrd_id))
+summary(wd3$visit_date)
+table(wd3$cluster)
+
+
+# Comparisons between clusters ####
+
+
+
+table(wd3$cluster)
+table(wd3$barn_type)
+table(wd3$season)
+table(wd3$year)
+
+## Welfare outcome measures ####
+# BCS
+bcs.av <- aov(BCS ~ cluster + barn_type + year + season,
+             data = wd3)
+
+par(mfrow = c(2,2))
+plot(bcs.av)
+par(mfrow = c(1,1))
+
+
+anova(bcs.av)
+
+
+
+emmeans(bcs.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(BCS))
+
+emmeans(bcs.av, ~ cluster) %>% 
+        multcomp::cld(Letters = letters,
+                      adjust = "bonferroni")
+
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(bcs.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(BCS))
+
+
+emmeans(bcs.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(BCS))
+
+
+emmeans(bcs.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(BCS))
+
+emmeans(bcs.av, ~ season) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+# Hock
+hock.av <- aov(HOCK ~ cluster + barn_type + year + season,
+              data = wd3)
+
+
+par(mfrow = c(2,2))
+plot(hock.av)
+par(mfrow = c(1,1))
+
+anova(hock.av)
+
+
+emmeans(hock.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(HOCK))
+
+emmeans(hock.av, ~ cluster) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(hock.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(HOCK))
+
+
+emmeans(hock.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(HOCK))
+
+emmeans(hock.av, ~ year) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(hock.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(HOCK))
+
+
+# Knee
+knee.av <- aov(KNEE ~ cluster + barn_type + year + season,
+               data = wd3)
+
+
+par(mfrow = c(2,2))
+plot(knee.av)
+par(mfrow = c(1,1))
+
+anova(knee.av)
+
+
+emmeans(knee.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(KNEE))
+
+
+emmeans(knee.av, ~ cluster) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(knee.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(KNEE))
+
+emmeans(knee.av, ~ barn_type) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(knee.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(KNEE))
+
+emmeans(knee.av, ~ year) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(knee.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(KNEE))
+
+emmeans(knee.av, ~ season) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+
+# Neck
+neck.av <- aov(NECK ~ cluster + barn_type + year + season,
+               data = wd3)
+
+
+par(mfrow = c(2,2))
+plot(neck.av)
+par(mfrow = c(1,1))
+
+
+anova(neck.av)
+
+
+emmeans(neck.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(NECK))
+
+
+emmeans(neck.av, ~ cluster) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(neck.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(NECK))
+
+emmeans(neck.av, ~ barn_type) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(neck.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(NECK))
+
+
+
+emmeans(neck.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(NECK))
+
+emmeans(neck.av, ~ season) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+# Lameness
+lame.av <- aov(LAME ~ cluster + barn_type + year + season,
+               data = wd3)
+
+
+par(mfrow = c(2,2))
+plot(lame.av)
+par(mfrow = c(1,1))
+
+
+anova(lame.av)
+
+
+emmeans(lame.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(LAME))
+
+
+emmeans(lame.av, ~ cluster) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(lame.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(LAME))
+
+
+emmeans(lame.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(LAME))
+
+
+emmeans(lame.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(LAME))
+
+
+
+## HSI ####
+HSI.av <- aov(HSI ~ cluster + barn_type + year + season,
+           data = wd3)
+
+par(mfrow = c(2,2))
+plot(HSI.av)
+par(mfrow = c(1,1))
+
+anova(HSI.av)
+
+
+emmeans(HSI.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(HSI))
+
+emmeans(HSI.av, ~ cluster) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(HSI.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(HSI))
+
+
+emmeans(HSI.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(HSI))
+
+emmeans(HSI.av, ~ year) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(HSI.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(HSI))
+
+
+
+
+# Generating a histogram to include in the manuscript
+RColorBrewer::brewer.pal(3, "Set1") 
+
+legend <- get_legend(ggplot(wd3,
+                            aes(x = HSI, fill = cluster)) +
+                       geom_histogram(alpha = 0.6, 
+                                      size = 0.15, color = "white") + 
+                       scale_fill_manual(values = c(RColorBrewer::brewer.pal(4, "Set1")[2],
+                                                    RColorBrewer::brewer.pal(4, "Set1")[3],
+                                                    RColorBrewer::brewer.pal(4, "Set1")[1]),
+                                         guide = guide_legend(
+                                           direction = "horizontal",
+                                           title.position = "bottom")) +
+                       labs(fill = "Cluster") +
+                       theme_classic(base_family = "Times New Roman") +
+                       theme(legend.position = "bottom",
+                             legend.text = element_text(size = 9),
+                             legend.title = element_text(size = 9),
+                             legend.key.size = unit(0.4, 'cm'),
+                             legend.title.align = 0.5))
+
+plot_grid(
+  
+  ggplot(wd3 %>% 
+           filter(cluster == 1), aes(x = HSI)) +
+    geom_histogram(aes(y=..density..), 
+                   position = 'identity',
+                   bins = 35, alpha = 0.6, 
+                   size = 0.15, color = "white",
+                   fill = RColorBrewer::brewer.pal(4, "Set1")[2]) +
+    labs(x = "Herd Status Index", 
+         y = "Density") +
+    scale_y_continuous(limits = c(0, 5),
+                       breaks = seq(0, 5, 1),
+                       expand = expansion(mult = 0, add = c(0.1, 0))) +
+    scale_x_continuous(limits = c(0.15, 0.85),
+                       breaks = seq(0.2, 0.8, 0.20),
+                       expand = expansion(mult = 0, add = c(0, 0))) +
+    theme_classic(base_family = "Times New Roman") +
+    theme(axis.text = element_text(size = 10, color = "black"),
+          axis.line = element_line(color = "black"),
+          axis.ticks = element_line(color = "black"),
+          axis.title.x = element_text(size = 12,
+                                      margin = margin(t = 5, # top
+                                                      r = 0, # right 
+                                                      b = 0, # bottom
+                                                      l = 0)),
+          axis.title.y = element_text(size = 12,
+                                      margin = margin(t = 0, # top
+                                                      r = 10, # right 
+                                                      b = 0, # bottom
+                                                      l = 0)))
+  ,
+  
+  ggplot(wd3 %>% 
+           filter(cluster == 2), aes(x = HSI)) +
+    geom_histogram(aes(y=..density..), 
+                   position = 'identity',
+                   bins = 35, alpha = 0.6, 
+                   size = 0.15, color = "white",
+                   fill = RColorBrewer::brewer.pal(4, "Set1")[3]) +
+    labs(x = "Herd Status Index", 
+         y = "Density") +
+    scale_y_continuous(limits = c(0, 5),
+                       breaks = seq(0, 5, 1),
+                       expand = expansion(mult = 0, add = c(0.1, 0))) +
+    scale_x_continuous(limits = c(0.15, 0.85),
+                       breaks = seq(0.2, 0.8, 0.20),
+                       expand = expansion(mult = 0, add = c(0, 0))) +
+    theme_classic(base_family = "Times New Roman") +
+    theme(axis.text = element_text(size = 10, color = "black"),
+          axis.line = element_line(color = "black"),
+          axis.ticks = element_line(color = "black"),
+          axis.title.x = element_text(size = 12,
+                                      margin = margin(t = 5, # top
+                                                      r = 0, # right 
+                                                      b = 0, # bottom
+                                                      l = 0)),
+          axis.title.y = element_text(size = 12,
+                                      margin = margin(t = 0, # top
+                                                      r = 10, # right 
+                                                      b = 0, # bottom
+                                                      l = 0)))
+  ,
+  
+  ggplot(wd3 %>% 
+           filter(cluster == 3), aes(x = HSI)) +
+    geom_histogram(aes(y=..density..), 
+                   position = 'identity',
+                   bins = 35, alpha = 0.6, 
+                   size = 0.15, color = "white",
+                   fill = RColorBrewer::brewer.pal(4, "Set1")[1]) +
+    labs(x = "Herd Status Index", 
+         y = "Density") +
+    scale_y_continuous(limits = c(0, 5),
+                       breaks = seq(0, 5, 1),
+                       expand = expansion(mult = 0, add = c(0.1, 0))) +
+    scale_x_continuous(limits = c(0.15, 0.85),
+                       breaks = seq(0.2, 0.8, 0.20),
+                       expand = expansion(mult = 0, add = c(0, 0))) +
+    theme_classic(base_family = "Times New Roman") +
+    theme(axis.text = element_text(size = 10, color = "black"),
+          axis.line = element_line(color = "black"),
+          axis.ticks = element_line(color = "black"),
+          axis.title.x = element_text(size = 12,
+                                      margin = margin(t = 5, # top
+                                                      r = 0, # right 
+                                                      b = 0, # bottom
+                                                      l = 0)),
+          axis.title.y = element_text(size = 12,
+                                      margin = margin(t = 0, # top
+                                                      r = 10, # right 
+                                                      b = 0, # bottom
+                                                      l = 0)))
+  ,
+  
+  NULL, # Creating space for legend
+  
+  ncol = 3, rel_heights = c(1, .20)
+  
+) + draw_grob(legend, 0.54, 0, 0, 0.1)
+
+
+
+
+## DHI metrics ####
+
+# 3+ lact
+avg_pcntg_lgvt.av <- aov(avg_pcntg_lgvt ~ cluster + barn_type + year + season,
+               data = wd3)
+
+
+anova(avg_pcntg_lgvt.av)
+
+
+emmeans(avg_pcntg_lgvt.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(avg_pcntg_lgvt))
+
+emmeans(avg_pcntg_lgvt.av, ~ cluster) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(avg_pcntg_lgvt.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(avg_pcntg_lgvt))
+
+emmeans(avg_pcntg_lgvt.av, ~ barn_type) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(avg_pcntg_lgvt.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(avg_pcntg_lgvt))
+
+emmeans(avg_pcntg_lgvt.av, ~ year) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(avg_pcntg_lgvt.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(avg_pcntg_lgvt))
+
+
+# involuntary_pcntg
+involuntary_pcntg.av <- aov(involuntary_pcntg ~ cluster + barn_type + year + season,
+                         data = wd3)
+
+
+anova(involuntary_pcntg.av)
+
+
+emmeans(involuntary_pcntg.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(involuntary_pcntg))
+
+emmeans(involuntary_pcntg.av, ~ cluster) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(involuntary_pcntg.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(involuntary_pcntg))
+
+
+emmeans(involuntary_pcntg.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(involuntary_pcntg))
+
+emmeans(involuntary_pcntg.av, ~ year) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(involuntary_pcntg.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(involuntary_pcntg))
+
+
+# avg_mortality_pcntg
+avg_mortality_pcntg.av <- aov(avg_mortality_pcntg ~ cluster + barn_type + year + season,
+                         data = wd3)
+
+
+anova(avg_mortality_pcntg.av)
+
+
+emmeans(avg_mortality_pcntg.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(avg_mortality_pcntg))
+
+emmeans(avg_mortality_pcntg.av, ~ cluster) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(avg_mortality_pcntg.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(avg_mortality_pcntg))
+
+
+emmeans(avg_mortality_pcntg.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(avg_mortality_pcntg))
+
+
+emmeans(avg_mortality_pcntg.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(avg_mortality_pcntg))
+
+
+# pctmun5
+# Number of missing values per cluster
+
+wd3 %>% 
+  filter(is.na(pctmun5)) %>% 
+  group_by(cluster) %>% 
+  summarise(n = n()) %>% 
+  mutate(perct = n/sum(n)*100)
+  
+
+
+pctmun5.av <- aov(pctmun5 ~ cluster + barn_type + year + season,
+                         data = wd3)
+
+
+anova(pctmun5.av)
+
+
+emmeans(pctmun5.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(pctmun5, na.rm = T))
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(pctmun5.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(pctmun5, na.rm = T))
+
+
+emmeans(pctmun5.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(pctmun5, na.rm = T))
+
+
+
+emmeans(pctmun5.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(pctmun5, na.rm = T))
+
+
+
+
+# pctpfratio11
+pctpfratio11.av <- aov(pctpfratio11 ~ cluster + barn_type + year + season,
+                         data = wd3)
+
+
+anova(pctpfratio11.av)
+
+
+emmeans(pctpfratio11.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(pctpfratio11))
+
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(pctpfratio11.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(pctpfratio11))
+
+emmeans(pctpfratio11.av, ~ barn_type) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(pctpfratio11.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(pctpfratio11))
+
+emmeans(pctpfratio11.av, ~ year) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(pctpfratio11.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(pctpfratio11))
+
+
+# enercorr_mi
+enercorr_mi.av <- aov(enercorr_mi ~ cluster + barn_type + year + season,
+                         data = wd3)
+
+
+anova(enercorr_mi.av)
+
+emm_options(opt.digits = FALSE)
+
+emmeans(enercorr_mi.av, ~ cluster) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(enercorr_mi, na.rm = T)) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(enercorr_mi.av, ~ barn_type) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(enercorr_mi, na.rm = T)) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+
+
+emmeans(enercorr_mi.av, ~ year) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(enercorr_mi, na.rm = T)) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+
+
+emmeans(enercorr_mi.av, ~ season) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(enercorr_mi, na.rm = T)) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+
+
+
+# avg_tci_yr
+avg_tci_yr.av <- aov(avg_tci_yr ~ cluster + barn_type + year + season,
+                         data = wd3)
+
+
+anova(avg_tci_yr.av)
+
+emmeans(avg_tci_yr.av, ~ cluster) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(avg_tci_yr, na.rm = T)) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(avg_tci_yr.av, ~ barn_type) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(avg_tci_yr, na.rm = T)) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+emmeans(avg_tci_yr.av, ~ barn_type) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(avg_tci_yr.av, ~ year) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(avg_tci_yr, na.rm = T)) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+emmeans(avg_tci_yr.av, ~ year) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(avg_tci_yr.av, ~ season) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(avg_tci_yr, na.rm = T)) %>% 
+  data.frame() %>% 
+  mutate_if(is.numeric, round, 1)
+
+
+emm_options(opt.digits = TRUE)
+
+
+# day_life_value_rank
+day_life_value_rank.av <- aov(day_life_value_rank ~ cluster + barn_type + year + season,
+                         data = wd3)
+
+
+anova(day_life_value_rank.av)
+
+
+emmeans(day_life_value_rank.av, ~ cluster)
+
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(day_life_value_rank, na.rm = TRUE))
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(day_life_value_rank.av, ~ barn_type)
+
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(day_life_value_rank, na.rm = TRUE))
+
+emmeans(day_life_value_rank.av, ~ barn_type) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(day_life_value_rank.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(day_life_value_rank, na.rm = TRUE))
+
+
+emmeans(day_life_value_rank.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(day_life_value_rank, na.rm = TRUE))
+
+
+
+# pctcalfdead
+pctcalfdead.av <- aov(pctcalfdead ~ cluster + barn_type + year + season,
+                         data = wd3)
+
+
+anova(pctcalfdead.av)
+
+emmeans(pctcalfdead.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(pctcalfdead))
+
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(pctcalfdead.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(pctcalfdead))
+
+
+
+emmeans(pctcalfdead.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(pctcalfdead))
+
+emmeans(pctcalfdead.av, ~ year) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(pctcalfdead.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(pctcalfdead))
+
+
+
+
+# age1stcalv
+age1stcalv.av <- aov(age1stcalv ~ cluster + barn_type + year + season,
+                         data = wd3)
+
+
+anova(age1stcalv.av)
+
+emmeans(age1stcalv.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(age1stcalv))
+
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(age1stcalv.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(age1stcalv))
+
+emmeans(age1stcalv.av, ~ barn_type) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(age1stcalv.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(age1stcalv))
+
+
+emmeans(age1stcalv.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(age1stcalv))
+
+
+# pct_lact_start_abortion
+pct_lact_start_abortion.av <- aov(pct_lact_start_abortion ~ cluster + barn_type + year + season,
+                         data = wd3)
+
+
+anova(pct_lact_start_abortion.av)
+
+
+emmeans(pct_lact_start_abortion.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(pct_lact_start_abortion))
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(pct_lact_start_abortion.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(pct_lact_start_abortion))
+
+
+
+emmeans(pct_lact_start_abortion.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(pct_lact_start_abortion))
+
+
+
+emmeans(pct_lact_start_abortion.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(pct_lact_start_abortion))
+
+
+
+
+# pctbhb20
+pctbhb20.av <- aov(pctbhb20 ~ cluster + barn_type + year + season,
+                         data = wd3)
+
+
+anova(pctbhb20.av)
+
+
+emmeans(pctbhb20.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(pctbhb20, na.rm = TRUE))
+
+emmeans(pctbhb20.av, ~ cluster) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(pctbhb20.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(pctbhb20, na.rm = TRUE))
+
+emmeans(pctbhb20.av, ~ barn_type) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(pctbhb20.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(pctbhb20, na.rm = TRUE))
+
+emmeans(pctbhb20.av, ~ year) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(pctbhb20.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(pctbhb20, na.rm = TRUE))
+
+
+
+# pctccs400
+pctccs400.av <- aov(pctccs400 ~ cluster + barn_type + year + season,
+                         data = wd3)
+
+
+anova(pctccs400.av)
+
+
+emmeans(pctccs400.av, ~ cluster)
+wd3 %>% 
+  group_by(cluster) %>% 
+  summarize(sd = sd(pctccs400))
+
+
+
+# Comparisons to include in the paper as supplementary material
+emmeans(pctccs400.av, ~ barn_type)
+wd3 %>% 
+  group_by(barn_type) %>% 
+  summarize(sd = sd(pctccs400))
+
+emmeans(pctccs400.av, ~ barn_type) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(pctccs400.av, ~ year)
+wd3 %>% 
+  group_by(year) %>% 
+  summarize(sd = sd(pctccs400))
+
+emmeans(pctccs400.av, ~ year) %>% 
+  multcomp::cld(Letters = letters,
+                adjust = "bonferroni")
+
+
+emmeans(pctccs400.av, ~ season)
+wd3 %>% 
+  group_by(season) %>% 
+  summarize(sd = sd(pctccs400))
+
